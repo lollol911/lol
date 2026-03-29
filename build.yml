@@ -1,0 +1,75 @@
+name: Build KernelSU AnyKernel3
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+        with:
+          repository: LineageOS/android_kernel_oneplus_sm4350
+          ref: lineage-21.0
+          path: kernel
+          fetch-depth: 0
+
+      - name: Checkout AnyKernel3
+        uses: actions/checkout@v4
+        with:
+          repository: osm0sis/AnyKernel3
+          path: anykernel
+          fetch-depth: 1
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev dwarves python3 rsync ccache git wget xz-utils zip unzip
+
+      - name: Fetch clang
+        run: |
+          mkdir -p toolchain
+          cd toolchain
+          git clone https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang
+          cd clang
+          git checkout d0e0a3882edb1acc193263ae98fce706e82aca38
+
+      - name: Add KernelSU
+        run: |
+          cd kernel
+          curl -LSs https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh | bash -s v0.9.5
+
+      - name: Prepare AnyKernel3
+        run: |
+          cp kernel/arch/arm64/boot/Image anykernel/Image
+          cp -r anykernel/* out_anykernel/ || true
+
+      - name: Build kernel
+        working-directory: kernel
+        env:
+          ARCH: arm64
+          SUBARCH: arm64
+          LLVM: 1
+          LLVM_IAS: 1
+          CC: clang
+          CROSS_COMPILE: aarch64-linux-android-
+          CLANG_TRIPLE: aarch64-linux-gnu-
+        run: |
+          export PATH="$GITHUB_WORKSPACE/toolchain/clang/bin:$PATH"
+          make O=out vendor/holi-qgki_defconfig
+          # Optional extra stability flags can be added here if needed
+          make O=out -j$(nproc) Image
+
+      - name: Package AnyKernel3
+        run: |
+          rm -f anykernel/Image
+          cp kernel/out/arch/arm64/boot/Image anykernel/Image
+          cd anykernel
+          zip -r9 ../AnyKernel3-KernelSU.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyKernel3-KernelSU
+          path: AnyKernel3-KernelSU.zip
