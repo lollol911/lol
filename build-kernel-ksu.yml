@@ -1,0 +1,514 @@
+# ============================================================
+#  Kernel + KernelSU (Official, Non-GKI) Build
+#  Device  : OnePlus Nord N200 5G (De2117)
+#  Source  : LineageOS/android_kernel_oneplus_sm4350 @ lineage-21
+#  KernelSU: tiann/KernelSU (official) — manual non-GKI integration
+#  Kernel  : 5.4.x GKI v1  →  hooks patched directly into source
+# ============================================================
+name: Kernel + KernelSU (Non-GKI)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: 'KernelSU branch or tag (e.g. main, v1.0.0)'
+        default: 'main'
+        required: false
+      # ── CLANG ─────────────────────────────────────────────────────────────
+      # Sourced from the exact AOSP prebuilts commit you used previously:
+      # https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+/d0e0a3882edb1acc193263ae98fce706e82aca38
+      # The tgz of that tree contains multiple clang-r*/ subdirs; the step
+      # below auto-selects the one whose `clang --version` reports 21.x.
+      clang_subdir_override:
+        description: 'Override clang subdir name inside the tarball (e.g. clang-r522817). Leave blank to auto-detect Clang 21.'
+        default: ''
+        required: false
+
+env:
+  KERNEL_REPO:   LineageOS/android_kernel_oneplus_sm4350
+  KERNEL_BRANCH: lineage-21
+  DEFCONFIG:     vendor/holi-qgki_defconfig
+  ARCH:          arm64
+
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  build:
+    name: Build De2117 Kernel + KernelSU
+    runs-on: ubuntu-22.04
+
+    steps:
+
+    # ── 0. Free up runner disk space ────────────────────────────────────────
+    - name: Free disk space
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache:    false
+        android:       true
+        dotnet:        true
+        haskell:       true
+        large-packages: true
+        docker-images: true
+        swap-storage:  false
+
+    # ── 1. Build dependencies ───────────────────────────────────────────────
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y \
+          bc bison build-essential ccache cpio curl flex \
+          g++-multilib gcc-multilib git libelf-dev libssl-dev \
+          libncurses5-dev lzop pahole python3 rsync unzip \
+          wget zip zlib1g-dev
+
+    # ── 2. Kernel source ────────────────────────────────────────────────────
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ env.KERNEL_REPO }}
+        ref:        ${{ env.KERNEL_BRANCH }}
+        path:       kernel_source
+        fetch-depth: 1
+
+    # ── 3. Toolchain cache ──────────────────────────────────────────────────
+    - name: Cache toolchain
+      id: cache-tc
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/toolchain
+        key:  tc-clang21-gcc49-aosp-v1
+
+    # ── 4. Download Clang 21 ────────────────────────────────────────────────
+    #
+    #  Source: AOSP prebuilts/clang/host/linux-x86 @ commit d0e0a38
+    #  That tarball bundles MANY clang-r* subdirectories (all versions).
+    #  We extract them all into a staging dir, then pick the one whose
+    #  `clang --version` reports 21.x — or use clang_subdir_override.
+    #
+    - name: Download Clang 21 toolchain
+      if: steps.cache-tc.outputs.cache-hit != 'true'
+      run: |
+        STAGING=$GITHUB_WORKSPACE/toolchain/clang_staging
+        CLANG_DIR=$GITHUB_WORKSPACE/toolchain/clang
+        mkdir -p "$STAGING" "$CLANG_DIR"
+
+        AOSP_TGZ_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/d0e0a3882edb1acc193263ae98fce706e82aca38.tar.gz"
+
+        echo "Downloading AOSP clang prebuilts tarball..."
+        # Gitiles redirects; follow with -L
+        wget -q --show-progress -L "$AOSP_TGZ_URL" -O clang_prebuilts.tar.gz
+
+        echo "Extracting tarball (this may take a moment)..."
+        # The tarball has no leading directory — extract to staging
+        tar -xf clang_prebuilts.tar.gz -C "$STAGING"
+        rm -f clang_prebuilts.tar.gz
+
+        echo "Contents of staging dir:"
+        ls "$STAGING" | head -40
+
+        OVERRIDE="${{ github.event.inputs.clang_subdir_override }}"
+
+        if [ -n "$OVERRIDE" ]; then
+          CHOSEN="$STAGING/$OVERRIDE"
+          if [ ! -d "$CHOSEN" ]; then
+            echo "ERROR: override subdir '$OVERRIDE' not found in tarball!" >&2
+            exit 1
+          fi
+          echo "Using override subdir: $OVERRIDE"
+        else
+          echo "Auto-detecting Clang 21 subdir..."
+          CHOSEN=""
+          for dir in "$STAGING"/clang-r*/; do
+            BIN="$dir/bin/clang"
+            [ -x "$BIN" ] || continue
+            VER=$("$BIN" --version 2>&1 | head -1)
+            echo "  $dir → $VER"
+            if echo "$VER" | grep -qE 'clang version 21\.'; then
+              CHOSEN="$dir"
+              break
+            fi
+          done
+
+          if [ -z "$CHOSEN" ]; then
+            echo "ERROR: No clang-r* subdir reported 'clang version 21.x'." >&2
+            echo "Re-run with clang_subdir_override set to the correct subdir name." >&2
+            exit 1
+          fi
+        fi
+
+        echo "Selected Clang subdir: $CHOSEN"
+        # Move the chosen subdir to the final location
+        cp -a "$CHOSEN/." "$CLANG_DIR/"
+        rm -rf "$STAGING"
+
+        echo "Clang version confirmed:"
+        "$CLANG_DIR/bin/clang" --version
+
+    # ── 5. Download AOSP GCC cross-compilers ────────────────────────────────
+    - name: Download GCC cross-compilers (ARM64 + ARM32)
+      if: steps.cache-tc.outputs.cache-hit != 'true'
+      run: |
+        git clone --depth=1 \
+          https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
+          $GITHUB_WORKSPACE/toolchain/gcc64 &
+
+        git clone --depth=1 \
+          https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 \
+          $GITHUB_WORKSPACE/toolchain/gcc32 &
+
+        wait
+
+    # ── 6. Export toolchain paths for all subsequent steps ──────────────────
+    - name: Export toolchain environment variables
+      run: |
+        CLANG_BIN=$GITHUB_WORKSPACE/toolchain/clang/bin
+        echo "CLANG_BIN=$CLANG_BIN"                                        >> $GITHUB_ENV
+        echo "GCC64=$GITHUB_WORKSPACE/toolchain/gcc64/bin/aarch64-linux-android-" >> $GITHUB_ENV
+        echo "GCC32=$GITHUB_WORKSPACE/toolchain/gcc32/bin/arm-linux-androideabi-" >> $GITHUB_ENV
+
+        echo "Clang version:"
+        "$CLANG_BIN/clang" --version
+
+    # ── 7. Clone official KernelSU ──────────────────────────────────────────
+    - name: Clone KernelSU (tiann/KernelSU)
+      run: |
+        cd kernel_source
+        KSU_REF="${{ github.event.inputs.ksu_ref || 'main' }}"
+
+        git clone --depth=1 \
+          https://github.com/tiann/KernelSU \
+          -b "$KSU_REF" \
+          KernelSU
+
+        KSU_VER=$(grep '^KSU_VERSION' KernelSU/kernel/Makefile \
+                  | cut -d= -f2 | tr -d ' ')
+        echo "KSU_VERSION=$KSU_VER" >> $GITHUB_ENV
+        echo "KernelSU version: $KSU_VER"
+
+        # Symlink KernelSU/kernel/ → drivers/kernelsu (standard placement)
+        ln -sfT ../../KernelSU/kernel drivers/kernelsu
+        echo "Symlink created: drivers/kernelsu → KernelSU/kernel"
+
+    # ── 8. Wire KernelSU into the kernel build system ───────────────────────
+    - name: Add KernelSU to drivers/Makefile and drivers/Kconfig
+      run: |
+        cd kernel_source
+
+        # drivers/Makefile — tell kbuild to compile drivers/kernelsu/
+        if ! grep -q 'CONFIG_KSU' drivers/Makefile; then
+          printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          echo "✓ drivers/Makefile updated"
+        else
+          echo "  drivers/Makefile already contains CONFIG_KSU entry"
+        fi
+
+        # drivers/Kconfig — expose KSU Kconfig options to menuconfig / olddefconfig
+        if ! grep -q 'kernelsu/Kconfig' drivers/Kconfig; then
+          sed -i '/^endmenu$/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          echo "✓ drivers/Kconfig updated"
+        else
+          echo "  drivers/Kconfig already contains kernelsu/Kconfig source"
+        fi
+
+    # ── 9. Non-GKI hook patches ─────────────────────────────────────────────
+    #
+    #  Your kernel is 5.4.x GKI v1.  KernelSU's kprobe-based auto-hooking
+    #  only works on GKI v2 (5.10+).  For GKI v1 / non-GKI, you must patch
+    #  four call-sites directly in the kernel source so KernelSU's core_hook.c
+    #  gets called at the right moments:
+    #
+    #    fs/exec.c            → intercept execve for su / manager detection
+    #    drivers/input/input.c → intercept key events for the root grant combo
+    #    fs/open.c            → intercept faccessat for /system/bin/su checks
+    #    fs/read_write.c      → intercept vfs_read (required for Zygisk support)
+    #
+    - name: Apply non-GKI KernelSU hook patches
+      run: |
+        cd kernel_source
+        python3 << 'PYEOF'
+        import sys
+
+        def patch_file(path, replacements):
+            """
+            Apply a list of (old_str, new_str, description) replacements.
+            old_str must exist exactly once; if new_str is already present
+            the replacement is silently skipped (idempotent).
+            """
+            with open(path, 'r') as fh:
+                src = fh.read()
+
+            dirty = False
+            for old, new, desc in replacements:
+                if old not in src:
+                    print(f"  [FATAL] Anchor not found in {path}:\n"
+                          f"          {repr(old[:80])}", file=sys.stderr)
+                    sys.exit(1)
+                if new in src:
+                    print(f"  [SKIP]  {path}: '{desc}' already applied")
+                    continue
+                src = src.replace(old, new, 1)
+                dirty = True
+                print(f"  [OK]    {path}: {desc}")
+
+            if dirty:
+                with open(path, 'w') as fh:
+                    fh.write(src)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # fs/exec.c
+        #   • Forward-declare ksu_handle_execveat* before do_execveat_common
+        #   • Call them right before the IS_ERR(filename) guard
+        # ─────────────────────────────────────────────────────────────────────
+        patch_file('fs/exec.c', [
+            (
+                # anchor: start of do_execveat_common
+                'static int do_execveat_common(',
+                # replacement: inject extern decls, then the original anchor
+                '#ifdef CONFIG_KSU\n'
+                'extern bool ksu_execveat_hook __read_mostly;\n'
+                'extern int ksu_handle_execveat(int *fd,\n'
+                '\t\tstruct filename **filename_ptr,\n'
+                '\t\tvoid *argv, void *envp, int *flags);\n'
+                'extern int ksu_handle_execveat_sucompat(int *fd,\n'
+                '\t\tstruct filename **filename_ptr,\n'
+                '\t\tvoid *argv, void *envp, int *flags);\n'
+                '#endif /* CONFIG_KSU */\n'
+                'static int do_execveat_common(',
+                'extern declarations'
+            ),
+            (
+                # anchor: first thing that can bail out of do_execveat_common
+                '\tif (IS_ERR(filename))\n'
+                '\t\treturn PTR_ERR(filename);',
+                # replacement: hook before the bail-out
+                '#ifdef CONFIG_KSU\n'
+                '\tif (unlikely(ksu_execveat_hook))\n'
+                '\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n'
+                '\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n'
+                '#endif /* CONFIG_KSU */\n'
+                '\tif (IS_ERR(filename))\n'
+                '\t\treturn PTR_ERR(filename);',
+                'execveat hook call'
+            ),
+        ])
+
+        # ─────────────────────────────────────────────────────────────────────
+        # drivers/input/input.c
+        #   • Forward-declare ksu_handle_input_handle_event before the function
+        #   • Call it right after disposition is computed so we can sniff keys
+        # ─────────────────────────────────────────────────────────────────────
+        patch_file('drivers/input/input.c', [
+            (
+                'static void input_handle_event(',
+                '#ifdef CONFIG_KSU\n'
+                'extern bool ksu_input_hook __read_mostly;\n'
+                'extern int ksu_handle_input_handle_event(unsigned int *type,\n'
+                '\t\tunsigned int *code, int *value);\n'
+                '#endif /* CONFIG_KSU */\n'
+                'static void input_handle_event(',
+                'extern declarations'
+            ),
+            (
+                # anchor: first statement inside input_handle_event
+                '\tint disposition = input_get_disposition(dev, type, code, &value);\n',
+                '\tint disposition = input_get_disposition(dev, type, code, &value);\n'
+                '#ifdef CONFIG_KSU\n'
+                '\tif (unlikely(ksu_input_hook))\n'
+                '\t\tksu_handle_input_handle_event(&type, &code, &value);\n'
+                '#endif /* CONFIG_KSU */\n',
+                'input hook call'
+            ),
+        ])
+
+        # ─────────────────────────────────────────────────────────────────────
+        # fs/open.c
+        #   • Forward-declare ksu_handle_faccessat before do_faccessat
+        #   • Call it as the very first thing in do_faccessat so KSU can
+        #     redirect /system/bin/su access checks before creds are evaluated
+        # ─────────────────────────────────────────────────────────────────────
+        patch_file('fs/open.c', [
+            (
+                'static int do_faccessat(',
+                '#ifdef CONFIG_KSU\n'
+                'extern int ksu_handle_faccessat(int *dfd,\n'
+                '\t\tconst char __user **filename_user,\n'
+                '\t\tint *mode, int *flags);\n'
+                '#endif /* CONFIG_KSU */\n'
+                'static int do_faccessat(',
+                'extern declarations'
+            ),
+            (
+                # anchor: first local variable in do_faccessat
+                '\tconst struct cred *old_cred;\n',
+                '#ifdef CONFIG_KSU\n'
+                '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n'
+                '#endif /* CONFIG_KSU */\n'
+                '\tconst struct cred *old_cred;\n',
+                'faccessat hook call'
+            ),
+        ])
+
+        # ─────────────────────────────────────────────────────────────────────
+        # fs/read_write.c
+        #   • Forward-declare ksu_handle_vfs_read before vfs_read
+        #   • Call it before the FMODE_READ permission check so KSU can
+        #     intercept reads that Zygisk needs to inject into processes
+        # ─────────────────────────────────────────────────────────────────────
+        patch_file('fs/read_write.c', [
+            (
+                'ssize_t vfs_read(',
+                '#ifdef CONFIG_KSU\n'
+                'extern int ksu_handle_vfs_read(struct file **file_ptr,\n'
+                '\t\tchar __user **buf_ptr, size_t *count_ptr,\n'
+                '\t\tloff_t **pos_ptr);\n'
+                '#endif /* CONFIG_KSU */\n'
+                'ssize_t vfs_read(',
+                'extern declarations'
+            ),
+            (
+                # anchor: first permission check in vfs_read
+                '\tif (!(file->f_mode & FMODE_READ))\n'
+                '\t\treturn -EBADF;\n',
+                '#ifdef CONFIG_KSU\n'
+                '\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n'
+                '#endif /* CONFIG_KSU */\n'
+                '\tif (!(file->f_mode & FMODE_READ))\n'
+                '\t\treturn -EBADF;\n',
+                'vfs_read hook call'
+            ),
+        ])
+
+        print("\n✓ All non-GKI KernelSU hook patches applied successfully.")
+        PYEOF
+
+    # ── 10. Generate .config and enable KSU Kconfig symbols ─────────────────
+    - name: Configure kernel
+      run: |
+        cd kernel_source
+
+        # Shared make arguments (reused for both defconfig and olddefconfig)
+        MAKE_ARGS=(
+          O=out
+          ARCH=${{ env.ARCH }}
+          CC="$CLANG_BIN/clang"
+          CLANG_TRIPLE=aarch64-linux-gnu-
+          CROSS_COMPILE="$GCC64"
+          CROSS_COMPILE_COMPAT="$GCC32"
+          LLVM=1
+          LLVM_IAS=1
+        )
+
+        # Load base defconfig
+        make "${MAKE_ARGS[@]}" ${{ env.DEFCONFIG }}
+
+        # ── Enable KernelSU Kconfig symbols ──────────────────────────────────
+        ./scripts/config --file out/.config \
+          -e CONFIG_KSU        \
+          -d CONFIG_KSU_DEBUG  \
+          -e CONFIG_OVERLAY_FS \
+          -e CONFIG_MODULES    \
+          -e CONFIG_MODULE_UNLOAD
+
+        # Resolve any new dependency choices to their defaults
+        make "${MAKE_ARGS[@]}" olddefconfig
+
+        echo ""
+        echo "KSU config check:"
+        grep -E 'CONFIG_KSU|CONFIG_OVERLAY_FS' out/.config || true
+
+    # ── 11. Build ────────────────────────────────────────────────────────────
+    #
+    #  LTO / MLGO / PGO / BOLT notes
+    #  ──────────────────────────────
+    #  Your defconfig (vendor/holi-qgki_defconfig) almost certainly already
+    #  has CONFIG_LTO_CLANG=y and possibly CONFIG_CFI_CLANG=y.  Passing
+    #  LLVM=1 + LD=ld.lld below honours those flags automatically — you do
+    #  not need to add anything extra for LTO to be active.
+    #
+    #  MLGO (ML-guided inlining) is a compile-time LLVM feature enabled by
+    #  passing -mllvm -enable-ml-inliner=release to clang.  If your previous
+    #  working build used this, add it to KCFLAGS below.
+    #
+    #  PGO for kernels is a two-pass process (instrument → collect → rebuild).
+    #  If your working build used a pre-collected profile, set KCFLAGS to
+    #  include -fprofile-use=<path> and upload the .profdata to the runner.
+    #
+    #  BOLT is a post-link binary optimizer.  It cannot be applied inside
+    #  a single CI job without a collected perf profile.  If you were using
+    #  it, you likely had a pre-built profile — add a BOLT step after make.
+    #
+    #  For now the build below mirrors your previously working flags as
+    #  closely as possible without those profile-dependent steps.  Uncomment
+    #  the KCFLAGS line and adjust as needed.
+    # ────────────────────────────────────────────────────────────────────────
+    - name: Build kernel
+      run: |
+        cd kernel_source
+
+        BUILD_FLAGS=(
+          -j$(nproc --all)
+          O=out
+          ARCH=${{ env.ARCH }}
+
+          # ── Toolchain ──────────────────────────────────────────────────────
+          CC="$CLANG_BIN/clang"
+          LD="$CLANG_BIN/ld.lld"
+          AR="$CLANG_BIN/llvm-ar"
+          NM="$CLANG_BIN/llvm-nm"
+          OBJCOPY="$CLANG_BIN/llvm-objcopy"
+          OBJDUMP="$CLANG_BIN/llvm-objdump"
+          READELF="$CLANG_BIN/llvm-readelf"
+          STRIP="$CLANG_BIN/llvm-strip"
+
+          CLANG_TRIPLE=aarch64-linux-gnu-
+          CROSS_COMPILE="$GCC64"
+          CROSS_COMPILE_COMPAT="$GCC32"
+
+          # ── Full LLVM mode (required for LTO / CFI) ────────────────────────
+          LLVM=1
+          LLVM_IAS=1
+
+          # ── Version tag embeds KSU version into kernel string ──────────────
+          LOCALVERSION="-ksu-v${{ env.KSU_VERSION }}"
+
+          # ── Uncomment and customise if you need extra compile flags ─────────
+          # KCFLAGS="-mllvm -enable-ml-inliner=release"   # MLGO
+          # KCFLAGS+="-fprofile-use=/path/to/kernel.profdata"  # PGO
+        )
+
+        make "${BUILD_FLAGS[@]}" 2>&1 | tee build.log
+
+        echo ""
+        echo "──────────────── Build output ────────────────"
+        ls -lh out/arch/${{ env.ARCH }}/boot/ || true
+
+    # ── 12. Collect artifacts ────────────────────────────────────────────────
+    - name: Collect artifacts
+      run: |
+        mkdir -p artifacts
+        BOOT=kernel_source/out/arch/${{ env.ARCH }}/boot
+
+        for img in Image Image.gz Image.gz-dtb dtb.img dtbo.img; do
+          [ -f "$BOOT/$img" ] \
+            && cp "$BOOT/$img" artifacts/ \
+            && echo "Collected: $img"
+        done
+
+        # Individual DTBs (some AnyKernel3 scripts need them)
+        find "$BOOT/dts" -name '*.dtb' \
+          -exec cp {} artifacts/ \; 2>/dev/null || true
+
+        # Build log (useful for debugging failed boots)
+        cp kernel_source/build.log artifacts/build.log 2>/dev/null || true
+
+        echo ""
+        echo "──────────────── Artifacts ────────────────"
+        ls -lh artifacts/
+
+    # ── 13. Upload ───────────────────────────────────────────────────────────
+    - name: Upload kernel artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-ksu-v${{ env.KSU_VERSION }}-run${{ github.run_number }}
+        path: artifacts/
+        if-no-files-found: error
+        retention-days: 30
